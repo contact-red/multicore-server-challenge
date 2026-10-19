@@ -79,6 +79,8 @@ actor \nodoc\ _RollbackTest is (pg.SessionStatusNotify &
   =>
     fail("rollback test connection failed")
 
+  be pg_session_shutdown(session: pg.Session) => None
+
   fun ref fail(message: String) =>
     _env.err.print(message)
     _env.exitcode(1)

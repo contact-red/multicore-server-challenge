@@ -1,4 +1,4 @@
-# Pony: Stallion + Postgres
+# Pony: Stallion + libpq
 
 Front: direct
 
@@ -7,12 +7,12 @@ Front: direct
 | Piece | Version |
 |-------|---------|
 | ponyc | 0.77.0  |
-| postgres | 3c52024d9f814fd0a2dbc01180cdd0e60a05fe4a |
+| libpq | system package |
 | stallion | becc51753ec076fdda011f7f9d5c73a50e814368 |
 
 ## Installation and Testing
 
-`DATABASE_URL` and `JWT_SECRET` are required. `HOST` defaults to `127.0.0.1`; `PORT` defaults to `3000`. `DB_WORKERS` defaults to 95 and accepts values from 1 through 95. On the benchmark box, direct serving uses `HOST=0.0.0.0 PORT=80`.
+`DATABASE_URL` and `JWT_SECRET` are required. `HOST` defaults to `127.0.0.1`; `PORT` defaults to `3000`. `DB_WORKERS` defaults to 95 and accepts values from 1 through 95. The database connection requires SCRAM authentication and disables TLS, matching the previous driver settings. On the benchmark box, direct serving uses `HOST=0.0.0.0 PORT=80`.
 
 ```sh
 sudo bash submissions/pony-stallion-contact-red/install.sh
@@ -38,7 +38,7 @@ Stallion is Pony's HTTP server. Each connection opens up a separate _Connection 
 
 ### _Worker
 
-A _Worker actor manages a single database connection. We spawn 95 of them at startup. As each _Connection is brought up, it is assigned a _Worker actor by round-robin.  Each _Worker actor handles its own internal queueing, and can support hundreds of _Connection actors.
+A _Worker actor manages a single database connection through a libpq Session actor. By default, we spawn 95 workers at startup. Each accepted _Connection is assigned a _Worker by round-robin. A worker queues requests from its connections; its Session sends one query at a time.
 
 ## Message Sequence Diagrams
 
@@ -73,13 +73,13 @@ sequenceDiagram
     participant Session as pg.Session
     participant DB as PostgreSQL
     participant Worker as _Worker
-    Session->>DB: wire connect and authenticate
+    Session->>DB: libpq connect and authenticate
     Session-->>Worker: pg_transaction_status(TransactionIdle)
     loop Each statement in _Catalog.all(), including rollback
         Worker-->>Session: prepare(name, SQL)
-        Session->>DB: wire prepare
-        Session-->>Worker: pg_transaction_status(TransactionIdle)
+        Session->>DB: libpq prepare
         Session-->>Worker: pg_statement_prepared(name)
+        Session-->>Worker: pg_transaction_status(TransactionIdle)
     end
     Worker->>Worker: Enter Ready and submit pending queries
 ```
@@ -177,7 +177,7 @@ sequenceDiagram
         Worker->>Worker: Create named prepared query and job
         Worker-->>Session: execute(query, worker)
         Note over Session: Session queues calls and executes them in order
-        Session->>DB: wire execute prepared statement
+        Session->>DB: libpq execute prepared statement
         alt Result
             DB->>Session: wire rows or command result
             Session-->>Worker: pg_query_result(session, result)
@@ -268,18 +268,11 @@ sequenceDiagram
         Conn->>Op: failed(data failure)
         Op->>Op: Store 500 outcome
         Conn->>Conn: _settle sends response
-        alt Parameter encoding failed before wire send
-            Note over Session,Worker: No transaction-status callback for this failed query
-            opt A later query callback arrives
-                Worker->>Worker: Prune the tombstone before matching that query
-            end
-        else Result decoding failed after wire response
-            Session-->>Worker: pg_transaction_status(session, status)
-            alt TransactionIdle
-                Worker->>Worker: Remove reported job and keep session
-            else Non-idle status
-                Worker->>Worker: Retire session and fail remaining submitted jobs
-            end
+        Session-->>Worker: pg_transaction_status(session, status)
+        alt TransactionIdle
+            Worker->>Worker: Remove the reported job and keep session
+        else Non-idle status
+            Worker->>Worker: Retire session and fail remaining submitted jobs
         end
     else Session failure or unexpected callback or status
         Session-->>Worker: Failure or unexpected callback
@@ -288,7 +281,7 @@ sequenceDiagram
         Session-->>Worker: pg_session_shutdown(session)
         Worker->>Worker: Enter Backoff and set one-second retry timer
         Worker->>Session: Construct replacement session on retry
-        Session->>DB: wire reconnect and authenticate
+        Session->>DB: libpq reconnect and authenticate
         Worker->>Worker: Reprepare catalog, then submit pending queries
     end
 ```

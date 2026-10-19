@@ -19,6 +19,34 @@ actor Main
           let config = _Config(env.vars)?
           _RollbackTest(TCPConnectAuth(env.root), config, env)
           return
+        elseif arg == "--test-session-boundary" then
+          let config = _Config(env.vars)?
+          _SessionBoundaryTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-dns-progress" then
+          let config = _Config(env.vars)?
+          _DNSProgressTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-session-shutdown" then
+          let config = _Config(env.vars)?
+          _SessionShutdownTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-startup-shutdown" then
+          let config = _Config(env.vars)?
+          _StartupShutdownTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-connection-nul" then
+          let config = _Config(env.vars)?
+          _ConnectionNulTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-queue-drain" then
+          let config = _Config(env.vars)?
+          _QueueDrainTest(TCPConnectAuth(env.root), config, env)
+          return
+        elseif arg == "--test-result-shapes" then
+          let config = _Config(env.vars)?
+          _ResultShapeTest(TCPConnectAuth(env.root), config, env)
+          return
         elseif arg == "--test-worker-data-error" then
           let config = _Config(env.vars)?
           _WorkerDataErrorTest(TCPConnectAuth(env.root), config, env, false)
@@ -113,6 +141,8 @@ class val _Config
     database = uri.PercentDecode(path) as String
     if (dbhost.size() == 0) or (user.size() == 0)
       or (database.size() == 0) then error end
+    if dbhost.contains("\0") or user.contains("\0") or
+      password.contains("\0") or database.contains("\0") then error end
     let count = _Input.decimal(
       try e("DB_WORKERS")? else "95" end)?
     if (count < 1) or (count > 95) then error end

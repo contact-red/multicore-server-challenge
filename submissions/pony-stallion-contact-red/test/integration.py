@@ -28,9 +28,12 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         self.frame_timeout = frame_timeout
         self.messages = []
         self.backends = []
+        self.frontends = []
         self.mutate_next_row = False
         self.drop_next_command_complete = False
         self.command_complete_gate = None
+        self.command_complete_held = threading.Event()
+        self.held_frontend = None
         self.command_complete_skip = 0
         self.command_complete_abort = False
         self.lock = threading.Lock()
@@ -53,6 +56,20 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
         with self.lock:
             self.mutate_next_row = True
 
+    def send_notice(self, frontend=None):
+        payload = b"SNOTICE\0Midle notice\0\0"
+        frame = b"N" + (len(payload) + 4).to_bytes(4, "big") + payload
+        with self.lock:
+            frontends = [frontend] if frontend is not None else list(self.frontends)
+        sent = 0
+        for frontend in frontends:
+            try:
+                frontend.sendall(frame)
+                sent += 1
+            except OSError:
+                pass
+        return sent
+
     def suppress_next_command_complete(self):
         with self.lock:
             self.drop_next_command_complete = True
@@ -60,6 +77,8 @@ class ProtocolProxy(socketserver.ThreadingTCPServer):
     def hold_command_complete_after(self, skipped):
         with self.lock:
             self.command_complete_gate = threading.Event()
+            self.command_complete_held.clear()
+            self.held_frontend = None
             self.command_complete_skip = skipped
             self.command_complete_abort = False
 
@@ -110,6 +129,7 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                 if len(self.server.messages) < 128:
                     self.server.messages.append(messages)
                     self.server.backends.append(backend)
+                    self.server.frontends.append(self.request)
 
             def downstream():
                 try:
@@ -137,6 +157,9 @@ class ProtocolConnection(socketserver.BaseRequestHandler):
                         if suppress:
                             continue
                         if gate is not None:
+                            with self.server.lock:
+                                self.server.held_frontend = self.request
+                                self.server.command_complete_held.set()
                             gate.wait(10)
                             with self.server.lock:
                                 abort = self.server.command_complete_abort
@@ -272,6 +295,7 @@ class Integration(unittest.TestCase):
         cls.secret = "integration-secret"
         cls.sql(f"CREATE DATABASE {cls.database} TEMPLATE conduit_dev")
         cls.addClassCleanup(cls.sql, f"DROP DATABASE {cls.database} WITH (FORCE)")
+        cls.sql(f"ALTER DATABASE {cls.database} SET DateStyle TO 'SQL, DMY'")
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             cls.port = listener.getsockname()[1]
@@ -466,6 +490,184 @@ class Integration(unittest.TestCase):
             if b"rollback" in parsed and b"rollback" in bound:
                 probes.append(traffic)
         self.assertEqual(len(probes), 1)
+
+    def test_database_hostname_connects(self):
+        env = self.server_env.copy()
+        env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+            "@127.0.0.1:", "@localhost:")
+        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        result = subprocess.run([str(executable), "--test-named-rollback"],
+                                env=env, capture_output=True, text=True,
+                                timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(),
+                         "named rollback after failed transaction passed")
+
+    def test_dns_resolution_does_not_block_scheduler(self):
+        source = Path(__file__).with_name("slow_dns.c")
+        with tempfile.TemporaryDirectory() as directory:
+            preload = Path(directory) / "slow_dns.so"
+            subprocess.run(["cc", "-shared", "-fPIC", str(source), "-ldl",
+                            "-o", str(preload)], check=True)
+            env = self.server_env.copy()
+            env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+                "@127.0.0.1:", "@localhost:")
+            env["LD_PRELOAD"] = str(preload)
+            marker = Path(directory) / "dns-entered"
+            release = Path(directory) / "dns-release"
+            env["CONDUIT_DNS_MARKER"] = str(marker)
+            env["CONDUIT_DNS_RELEASE"] = str(release)
+            executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+            process = subprocess.Popen(
+                [str(executable), "--ponymaxthreads=1", "--test-dns-progress"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True)
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stderr, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(5),
+                                    "delayed DNS hook was not entered")
+                self.assertEqual(process.stderr.readline().strip(),
+                                 "DNS delay entered")
+                self.assertTrue(marker.exists())
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(5),
+                                    "DNS resolution blocked the scheduler")
+                self.assertEqual(process.stdout.readline().strip(),
+                                 "scheduler progressed")
+                release.touch()
+                _, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, errors)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_session_rejects_truncated_strings_and_preserves_status(self):
+        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        result = subprocess.run([str(executable), "--test-session-boundary"],
+                                env=self.server_env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "session boundaries passed")
+
+    def test_session_shutdown_settles_accepted_commands(self):
+        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        result = subprocess.run([str(executable), "--test-session-shutdown"],
+                                env=self.server_env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(),
+                         "session shutdown settled commands")
+
+    def test_startup_shutdown_settles_accepted_commands(self):
+        source = Path(__file__).with_name("slow_dns.c")
+        with tempfile.TemporaryDirectory() as directory:
+            preload = Path(directory) / "slow_dns.so"
+            subprocess.run(["cc", "-shared", "-fPIC", str(source), "-ldl",
+                            "-o", str(preload)], check=True)
+            env = self.server_env.copy()
+            env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+                "@127.0.0.1:", "@localhost:")
+            env["LD_PRELOAD"] = str(preload)
+            marker = Path(directory) / "dns-entered"
+            release = Path(directory) / "dns-release"
+            env["CONDUIT_DNS_MARKER"] = str(marker)
+            env["CONDUIT_DNS_RELEASE"] = str(release)
+            executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+            process = subprocess.Popen([str(executable),
+                                        "--test-startup-shutdown"], env=env,
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(5),
+                                    "shutdown did not finish during DNS")
+                output = process.stdout.readline().strip()
+                self.assertTrue(marker.exists(),
+                                "delayed DNS hook was not entered")
+                release.touch()
+                _, errors = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, errors)
+                self.assertIn("DNS delay entered", errors)
+                self.assertEqual(output,
+                                 "startup shutdown settled commands")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_connection_fields_reject_nul(self):
+        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        result = subprocess.run([str(executable), "--test-connection-nul"],
+                                env=self.server_env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(),
+                         "connection fields rejected NUL")
+
+    def test_result_shapes_reject_nested_arrays_and_keep_infinities(self):
+        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        result = subprocess.run([str(executable), "--test-result-shapes"],
+                                env=self.server_env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "result shapes passed")
+
+    def test_deep_rejection_queue_drains(self):
+        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        result = subprocess.run([str(executable), "--test-queue-drain"],
+                                env=self.server_env, capture_output=True,
+                                text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "deep rejection queue drained")
+
+    def test_database_url_rejects_nul(self):
+        env = self.server_env.copy()
+        env["DATABASE_URL"] = env["DATABASE_URL"].replace(
+            "/" + self.database, "/%00")
+        executable = Path(__file__).resolve().parents[1] / "bin" / "conduit"
+        result = subprocess.run([str(executable), "--test-named-rollback"],
+                                env=env, capture_output=True, text=True,
+                                timeout=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Invalid configuration", result.stderr)
+
+    def test_idle_notice_does_not_complete_query(self):
+        before = len(self.proxy.snapshot())
+        self.assertGreater(self.proxy.send_notice(), 0)
+        time.sleep(1.2)
+        self.assertEqual(self.request("GET", "/api/tags")[0], 200)
+        self.assertEqual(len(self.proxy.snapshot()), before)
+
+    def test_notice_does_not_complete_inflight_query(self):
+        before = len(self.proxy.snapshot())
+        self.proxy.hold_command_complete_after(0)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                request = pool.submit(self.request, "GET", "/api/tags")
+                self.assertTrue(self.proxy.command_complete_held.wait(5))
+                with self.proxy.lock:
+                    frontend = self.proxy.held_frontend
+                offset = os.fstat(self.server_log.fileno()).st_size
+                self.assertGreater(self.proxy.send_notice(frontend), 0)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    size = os.fstat(self.server_log.fileno()).st_size
+                    if b"idle notice" in os.pread(
+                            self.server_log.fileno(), size - offset, offset):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("libpq did not consume the notice")
+                self.assertFalse(request.done())
+                self.proxy.release_command_complete()
+                self.assertEqual(request.result(timeout=5)[0], 200)
+        finally:
+            self.proxy.release_command_complete(abort=True)
+        self.assertEqual(len(self.proxy.snapshot()), before)
 
     def test_presend_data_error_keeps_worker_query_order(self):
         before = len(self.proxy.snapshot())
@@ -953,6 +1155,24 @@ class Integration(unittest.TestCase):
                 self.assert_article(response, title, tags or [])
         self.assertEqual(self.db(
             f"SELECT id FROM tags WHERE name={self.literal(existing)}"), existing_id)
+
+    def test_timestamp_values_across_postgres_epoch(self):
+        title = "timestamp_" + uuid.uuid4().hex
+        status, created = self.request("POST", "/api/articles",
+            self.article(title, []), self.token(self.author()))
+        self.assertEqual(status, 201)
+        slug = self.literal(created["article"]["slug"])
+        self.db("UPDATE articles SET "
+                "created_at = TIMESTAMPTZ '1999-12-31 23:59:59.123456+00', "
+                "updated_at = TIMESTAMPTZ '2000-01-01 00:00:00.987654+00' "
+                f"WHERE slug = {slug}")
+        status, fetched = self.request(
+            "GET", "/api/articles/" + created["article"]["slug"])
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["article"]["createdAt"],
+                         "1999-12-31T23:59:59.123Z")
+        self.assertEqual(fetched["article"]["updatedAt"],
+                         "2000-01-01T00:00:00.987Z")
 
     def test_sql_json_list_and_tags(self):
         suffix = uuid.uuid4().hex

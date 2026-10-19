@@ -3,12 +3,13 @@ FETCH ?= corral fetch
 CC ?= cc
 AR ?= ar
 CFLAGS ?= -O3 -std=c11
+LIBPQ_LIBDIR ?= /usr/lib/x86_64-linux-gnu
 
 .PHONY: build test test-integration clean
 build: native/libconduit_password.a
 	$(FETCH)
 	mkdir -p bin
-	corral run -- $(PONYC) -Dopenssl_3.0.x app -o bin -b conduit -p native
+	corral run -- $(PONYC) -Dopenssl_3.0.x app -o bin -b conduit -p native -L $(LIBPQ_LIBDIR)
 
 native/libconduit_password.a: native/crypt_blowfish.o native/password.o
 	$(AR) rcs $@ $^

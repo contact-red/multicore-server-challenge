@@ -22,7 +22,9 @@ actor \nodoc\ _WorkerDataErrorTest is (_QueryClient & _WorkerBarrier)
       else recover val [as _Param: bad] end
       end
     _worker.query(this, 1, _Tags, params)
-    if not decode then _worker.query(this, 2, _Tags, params) end
+    if not decode then
+      _worker.query(this, 2, _Tags, _P.one("before\0after"))
+    end
     _worker.query(this, if decode then 2 else 3 end, _Tags, _P.none())
 
   be db_result(id: U64, result: pg.Result) =>

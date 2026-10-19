@@ -21,6 +21,14 @@ actor \nodoc\ _WorkerForeignCallbackTest is
   be pg_session_authenticated(session: pg.Session) =>
     if session is _foreign then session.close() end
 
+  be pg_transaction_status(session: pg.Session,
+    status: pg.TransactionStatus) => None
+
+  be pg_session_connection_failed(session: pg.Session,
+    reason: pg.ConnectionFailureReason) => None
+
+  be pg_session_shutdown(session: pg.Session) => None
+
   be db_result(id: U64, result: pg.Result) =>
     if id == 1 then
       if _first then

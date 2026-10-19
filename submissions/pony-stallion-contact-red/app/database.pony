@@ -99,6 +99,8 @@ actor _Worker is (pg.SessionStatusNotify & pg.ResultReceiver &
   var _head: (_Job | None) = None
   var _tail: (_Job | None) = None
 
+  be pg_session_authenticated(session: pg.Session) => None
+
   new create(auth: TCPConnectAuth, config: _Config, timers: Timers,
     err: OutStream)
   =>
