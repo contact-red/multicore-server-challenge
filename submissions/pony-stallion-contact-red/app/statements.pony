@@ -8,7 +8,7 @@ type _RequestStatement is (
   _ArticleUpdate |
   _ArticleDelete |
   _ArticleIdBySlug | _FavoriteInsert | _FavoriteDelete |
-  _CommentsByArticle | _CommentInput | _CommentInsert |
+  _CommentsBySlug | _CommentInput | _CommentInsert |
   _CommentOwner | _CommentDelete)
 
 type _Statement is (_RequestStatement | _Rollback)
@@ -37,7 +37,7 @@ primitive _ArticleDelete
 primitive _ArticleIdBySlug
 primitive _FavoriteInsert
 primitive _FavoriteDelete
-primitive _CommentsByArticle
+primitive _CommentsBySlug
 primitive _CommentInput
 primitive _CommentInsert
 primitive _CommentOwner
@@ -45,6 +45,39 @@ primitive _CommentDelete
 primitive _Rollback
 
 primitive _Catalog
+  fun kind(statement: _RequestStatement): USize =>
+    match statement
+    | _Tags => 0
+    | _RegisterUser => 1
+    | _LoginUser => 2
+    | _CurrentUser => 3
+    | _UpdateUser => 4
+    | _Profile => 5
+    | _FollowTarget => 6
+    | _FollowInsert => 7
+    | _FollowDelete => 8
+    | _ArticlePageAll => 9
+    | _ArticlePageFeed => 10
+    | _ArticlePageTag => 11
+    | _ArticlePageAuthor => 12
+    | _ArticlePageFavorited => 13
+    | _ArticleFullBySlug => 14
+    | _ArticleFullById => 15
+    | _ArticleInsert => 16
+    | _ArticleIdAndAuthorBySlug => 17
+    | _ArticleUpdateInput => 18
+    | _ArticleUpdate => 19
+    | _ArticleDelete => 20
+    | _ArticleIdBySlug => 21
+    | _FavoriteInsert => 22
+    | _FavoriteDelete => 23
+    | _CommentsBySlug => 24
+    | _CommentInput => 25
+    | _CommentInsert => 26
+    | _CommentOwner => 27
+    | _CommentDelete => 28
+    end
+
   fun all(): Array[_Statement] val =>
     recover val
       Array[_Statement]
@@ -59,7 +92,7 @@ primitive _Catalog
         .>push(_ArticleUpdateInput).>push(_ArticleUpdate)
         .>push(_ArticleDelete)
         .>push(_ArticleIdBySlug).>push(_FavoriteInsert)
-        .>push(_FavoriteDelete).>push(_CommentsByArticle)
+        .>push(_FavoriteDelete).>push(_CommentsBySlug)
         .>push(_CommentInput).>push(_CommentInsert).>push(_CommentOwner)
         .>push(_CommentDelete).>push(_Rollback)
     end
@@ -90,7 +123,7 @@ primitive _Catalog
     | _ArticleIdBySlug => "article_id_by_slug"
     | _FavoriteInsert => "favorite_insert"
     | _FavoriteDelete => "favorite_delete"
-    | _CommentsByArticle => "comments_by_article"
+    | _CommentsBySlug => "comments_by_slug"
     | _CommentInput => "comment_input"
     | _CommentInsert => "comment_insert"
     | _CommentOwner => "comment_owner"
@@ -138,7 +171,7 @@ primitive _Catalog
     | _FollowDelete =>
       "DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2"
     | _ArticlePageAll =>
-      _SQL.article_list(_SQL.article(false) + _SQL.order_page(),
+      _SQL.article_list(_SQL.article_page(),
         "SELECT count(*) AS total FROM " +
         "(SELECT 1 FROM articles a LIMIT 1000) s")
     | _ArticlePageFeed =>
@@ -165,9 +198,8 @@ primitive _Catalog
         LIMIT 1000) s
       """)
     | _ArticlePageAuthor =>
-      _SQL.article_list(_SQL.article(false) + " WHERE a.author_id = "
-        + "(SELECT au.id FROM users au WHERE au.username = $4)"
-        + _SQL.order_page(),
+      _SQL.article_list(_SQL.article_page("WHERE a.author_id = " +
+        "(SELECT au.id FROM users au WHERE au.username = $4)"),
         "SELECT count(*) AS total FROM (SELECT 1 FROM articles a " +
         "WHERE a.author_id = " +
         "(SELECT u.id FROM users u WHERE u.username = $4) " +
@@ -198,7 +230,7 @@ primitive _Catalog
         + "ON CONFLICT DO NOTHING"
     | _FavoriteDelete =>
       "DELETE FROM favorites WHERE user_id = $1 AND article_id = $2"
-    | _CommentsByArticle => _SQL.comments()
+    | _CommentsBySlug => _SQL.comments()
     | _CommentInput => _SQL.comment_input()
     | _CommentInsert => _SQL.insert_comment()
     | _CommentOwner =>

@@ -1,11 +1,31 @@
-use json = "json"
 use pg = "postgres"
 use stallion = "stallion"
 use uri = "uri"
+use "time"
+
+interface ref _HashNext
+  fun ref apply(operation: _Operation ref, hash: String) ?
+
+interface ref _VerifyNext
+  fun ref apply(operation: _Operation ref, verified: Bool) ?
+
+primitive _HashWaiting
+primitive _VerifyWaiting
+type _PasswordWaitKind is (None | _HashWaiting | _VerifyWaiting)
+
+class _HashWait
+  let next: _HashNext
+  new create(next': _HashNext) => next = next'
+
+class _VerifyWait
+  let next: _VerifyNext
+  new create(next': _VerifyNext) => next = next'
 
 class _Operation
   let _request: _Request
   let _worker: _Worker
+  let _passwords: (_PasswordDispatcher | None)
+  var _password_wait: (None | _HashWait | _VerifyWait) = None
   var _next: (_Next | None) = None
   var _outcome: ((U16, String) | None) = None
   var _viewer: I64 = 0
@@ -14,15 +34,83 @@ class _Operation
   var _name: String = ""
   var _method: String = ""
 
-  new create(request': _Request, worker: _Worker) =>
+  new create(request': _Request, worker: _Worker,
+    passwords: (_PasswordDispatcher | None) = None)
+  =>
     _request = request'
     _worker = worker
+    _passwords = passwords
+
+  fun password_waiting(): _PasswordWaitKind =>
+    match _password_wait
+    | let _: _HashWait box => _HashWaiting
+    | let _: _VerifyWait box => _VerifyWaiting
+    else None
+    end
+
+  fun _test_request(): stallion.Request => _request._4
+
+  fun ref hash_password(password: String, next': _HashNext) ? =>
+    match _passwords
+    | let passwords: _PasswordDispatcher =>
+      _password_wait = _HashWait(next')
+      passwords.submit(_PasswordHashJob(_request._2, _request._3, password))
+    else next'(this, _Password.hash(password)?)?
+    end
+
+  fun ref verify_password(password: String, hash: String,
+    next': _VerifyNext) ?
+  =>
+    match _passwords
+    | let passwords: _PasswordDispatcher =>
+      _password_wait = _VerifyWait(next')
+      passwords.submit(_PasswordVerifyJob(_request._2, _request._3,
+        password, hash))
+    else next'(this, _Password.verify(password, hash))?
+    end
+
+  fun ref hashed(outcome': _HashOutcome) =>
+    match _password_wait
+    | let wait: _HashWait =>
+      _password_wait = None
+      try
+        match outcome'
+        | let hash: String => wait.next(this, hash)?
+        else error_reply(422, "invalid request")
+        end
+      else error_reply(422, "invalid request")
+      end
+    end
+
+  fun ref verified(outcome': _VerifyOutcome) =>
+    match _password_wait
+    | let wait: _VerifyWait =>
+      _password_wait = None
+      try wait.next(this, outcome' is _PasswordVerified)?
+      else error_reply(500, "invalid database result")
+      end
+    end
+
+  fun ref _test_password_continuation_error() =>
+    match _password_wait
+    | let _: _HashWait =>
+      _password_wait = _HashWait(
+        {ref(operation: _Operation ref, hash: String) ? => error })
+    | let _: _VerifyWait =>
+      _password_wait = _VerifyWait(
+        {ref(operation: _Operation ref, verified: Bool) ? => error })
+    end
 
   fun ref query(statement: _RequestStatement, params: Array[_Param] val,
     next': _Next)
   =>
     _next = next'
-    _worker.query(_request._2, _request._3, statement, params)
+    ifdef "conduit_diagnostic" then
+      _worker.query(_request._2, _request._3, statement, params,
+        Time.nanos())
+    else
+      _worker.query(_request._2, _request._3, statement, params)
+    end
 
   fun ref result(result': pg.Result) =>
     try
@@ -41,17 +129,14 @@ class _Operation
     else error_reply(500, "database error")
     end
 
-  fun ref reply(status: U16, value: json.JSONValue = None) =>
-    let body: String val = if status == 204 then ""
-      else json.JSONPrinter.print(value)
-      end
-    _outcome = (status, body)
+  fun ref reply(status: U16, body: String = "") =>
+    _outcome = (status, if status == 204 then "" else body end)
 
   fun ref reply_json(status: U16, row: pg.Row) ? =>
-    _outcome = (status, row.fields(0)?.value as String)
+    _outcome = (status, row.fields(0)? as String)
 
   fun ref error_reply(status: U16, message: String) =>
-    reply(status, _Output.error_value(message))
+    reply(status, _Output.error_body(message))
 
   fun ref outcome(): ((U16, String) | None) => _outcome
 
@@ -149,7 +234,7 @@ class _Operation
         _JWT.issue(_request._6, _Output.id(row)?)?
       else _token
       end
-      reply(status, json.JSONObject.update("user", _Output.user(row, token)?))
+      reply(status, _Output.user_body(row, token)?)
     else error_reply(401, "unauthorized")
     end
 
@@ -157,11 +242,11 @@ class _Operation
     let obj = _Input.wrapper(_request._5, "user")?
     let username = _Input.required(obj, "username")?
     let email = _Input.required(obj, "email")?
-    let hash' = _Password.hash(_Input.required(obj, "password")?)?
-    let op = this
-    query(_RegisterUser, _P.three(username, email, hash'),
-      {ref(w': _Operation ref, r: pg.Result) ? =>
-        op.user_response(r, true, 201)? })
+    hash_password(_Input.required(obj, "password")?,
+      {ref(op: _Operation ref, hash': String) =>
+        op.query(_RegisterUser, _P.three(username, email, hash'),
+          {ref(w': _Operation ref, r: pg.Result) ? =>
+            w'.user_response(r, true, 201)? }) })?
 
   fun ref login() ? =>
     let obj = _Input.wrapper(_request._5, "user")?
@@ -172,10 +257,11 @@ class _Operation
       {ref(w': _Operation ref, r: pg.Result) ? =>
         match _Output.first(r)?
         | let row: pg.Row =>
-          if _Password.verify(password, row.fields(5)?.value as String) then
-            op.user_response(r, true)?
-          else w'.error_reply(401, "invalid email or password")
-          end
+          op.verify_password(password, row.fields(5)? as String,
+            {ref(w'': _Operation ref, verified': Bool) ? =>
+              if verified' then w''.user_response(r, true)?
+              else w''.error_reply(401, "invalid email or password") end
+            })?
         else w'.error_reply(401, "invalid email or password")
         end
       })
@@ -190,25 +276,30 @@ class _Operation
     let obj = _Input.wrapper(_request._5, "user")?
     let email = _Input.optional(obj, "email")?
     let username = _Input.optional(obj, "username")?
-    let hash': (String | None) = match _Input.optional(obj, "password")?
-      | let password: String => _Password.hash(password)?
-      else None
-      end
+    let password = _Input.optional(obj, "password")?
     let bio = _Input.optional(obj, "bio", false)?
     let image = _Input.optional(obj, "image", false)?
-    let op = this
-    query(_UpdateUser,
-      _P.six(_viewer, email, username, hash', bio, image),
+    match password
+    | let text: String =>
+      hash_password(text, {ref(op: _Operation ref, hash': String) =>
+        op.update_user_query(email, username, hash', bio, image) })?
+    else update_user_query(email, username, None, bio, image)
+    end
+
+  fun ref update_user_query(email: (String | None),
+    username: (String | None), hash': (String | None),
+    bio: (String | None), image: (String | None))
+  =>
+    query(_UpdateUser, _P.six(_viewer, email, username, hash', bio, image),
       {ref(w': _Operation ref, r: pg.Result) ? =>
-        op.user_response(r, false)? })
+        w'.user_response(r, false)? })
 
   fun ref profile() =>
     query(_Profile, _P.two(_viewer, _name),
       {ref(w': _Operation ref, r: pg.Result) ? =>
         match _Output.first(r)?
         | let row: pg.Row =>
-          w'.reply(200, json.JSONObject.update("profile",
-            _Output.profile(row, 1)?))
+          w'.reply(200, _Output.profile_body(row, 1)?)
         else w'.error_reply(404, "profile not found")
         end
       })
@@ -227,8 +318,7 @@ class _Operation
           end
           w'.query(statement, _P.two(viewer, _Output.id(row)?),
             {ref(w'': _Operation ref, r': pg.Result) ? =>
-              w''.reply(200, json.JSONObject.update("profile",
-                _Output.profile(row, 1, following)?)) })
+              w''.reply(200, _Output.profile_body(row, 1, following)?) })
         else w'.error_reply(404, "profile not found")
         end
       })
@@ -270,8 +360,7 @@ class _Operation
       {ref(w': _Operation ref, r: pg.Result) ? =>
         match _Output.first(r)?
         | let row: pg.Row =>
-          w'.reply(status, json.JSONObject.update("article",
-            _Output.article(row, true)?))
+          w'.reply(status, _Output.article_body(row)?)
         else w'.error_reply(404, "article not found")
         end
       })
@@ -307,18 +396,18 @@ class _Operation
     query(_ArticleUpdateInput, _P.two(_slug, _request._5),
       {ref(w': _Operation ref, r: pg.Result)(op, viewer) ? =>
         let row = _Output.first(r)? as pg.Row
-        if not (row.fields(0)?.value as Bool) then
+        if not (row.fields(0)? as Bool) then
           w'.error_reply(422, "invalid request")
-        elseif row.fields(1)?.value is None then
+        elseif row.fields(1)? is None then
           w'.error_reply(404, "article not found")
         elseif _Output.id(row, 2)? != viewer then
           w'.error_reply(403, "not the author")
         else
           let id = _Output.id(row, 1)?
           w'.query(_ArticleUpdate, _P.four(id,
-              row.fields(3)?.value as (String | None),
-              row.fields(4)?.value as (String | None),
-              row.fields(5)?.value as (String | None)),
+              row.fields(3)? as (String | None),
+              row.fields(4)? as (String | None),
+              row.fields(5)? as (String | None)),
             {ref(w'': _Operation ref, r': pg.Result) =>
               op.full_article(_ArticleFullById, id) })
         end
@@ -356,35 +445,35 @@ class _Operation
     })
 
   fun ref comments() =>
-    let viewer = _viewer
-    with_article({ref(w': _Operation ref, r: pg.Result) ? =>
-      let id = _Output.id(_Output.first(r)? as pg.Row)?
-      w'.query(_CommentsByArticle, _P.two(viewer, id),
-        {ref(w'': _Operation ref, r': pg.Result) ? =>
-          var comments' = json.JSONArray
-          for row in _Output.rows(r')?.values() do
-            comments' = comments'.push(_Output.comment(row)?)
-          end
-          w''.reply(200, json.JSONObject.update("comments", comments'))
-        })
-    })
+    query(_CommentsBySlug, _P.two(_viewer, _slug),
+      {ref(w': _Operation ref, r: pg.Result) ? =>
+        let rows = _Output.rows(r)?
+        if rows.size() == 0 then
+          w'.error_reply(404, "article not found")
+        else
+          let comments: pg.Rows = if rows(0)?.fields(0)? is None then
+            recover val Array[pg.Row] end
+          else rows end
+          w'.reply(200, _Output.comments_body(comments)?)
+        end
+      })
 
   fun ref create_comment() =>
     let viewer = _viewer
     query(_CommentInput, _P.two(_slug, _request._5),
       {ref(w': _Operation ref, r: pg.Result)(viewer) ? =>
         let row = _Output.first(r)? as pg.Row
-        if not (row.fields(0)?.value as Bool) then
+        if not (row.fields(0)? as Bool) then
           w'.error_reply(422, "invalid request")
-        elseif row.fields(1)?.value is None then
+        elseif row.fields(1)? is None then
           w'.error_reply(404, "article not found")
         else
           w'.query(_CommentInsert,
             _P.three(_Output.id(row, 1)?, viewer,
-              row.fields(2)?.value as String),
+              row.fields(2)? as String),
             {ref(w'': _Operation ref, r': pg.Result) ? =>
-              w''.reply(201, json.JSONObject.update("comment",
-                _Output.comment(_Output.first(r')? as pg.Row, false)?))
+              w''.reply(201,
+                _Output.comment_body(_Output.first(r')? as pg.Row, false)?)
             })
         end
     })

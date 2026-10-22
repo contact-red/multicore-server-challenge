@@ -27,7 +27,7 @@ primitive _P
     recover val [as _Param: a; b; c; d; e; f] end
 
 primitive _SQL
-  fun article(full: Bool): String =>
+  fun article(full: Bool, source: String = "articles"): String =>
     "SELECT a.id, a.slug, a.title, a.description, "
       + (if full then "a.body, " else "" end)
       + """
@@ -42,8 +42,13 @@ primitive _SQL
         EXISTS(SELECT 1 FROM follows fo
           WHERE fo.follower_id = $1 AND fo.followee_id = a.author_id)
           AS following
-        FROM articles a JOIN users u ON u.id = a.author_id
         """
+      + " FROM " + source + " a JOIN users u ON u.id = a.author_id "
+
+  fun article_page(filter: String = ""): String =>
+    article(false, "(SELECT a.id, a.slug, a.title, a.description, " +
+      "a.created_at, a.updated_at, a.author_id FROM articles a " +
+      filter + order_page() + ")") + " ORDER BY a.id DESC"
 
   fun article_list(page: String, count': String): String =>
     "WITH page AS (" + page + "), total AS (" + count' + ") " +
@@ -153,8 +158,12 @@ primitive _SQL
       u.username, u.bio, u.image,
       EXISTS(SELECT 1 FROM follows fo
         WHERE fo.follower_id = $1 AND fo.followee_id = c.author_id)
-    FROM comments c JOIN users u ON u.id = c.author_id
-    WHERE c.article_id = $2 ORDER BY c.created_at DESC, c.id DESC LIMIT 100
+    FROM articles a
+    LEFT JOIN LATERAL (SELECT c.id, c.body, c.created_at, c.updated_at,
+      c.author_id FROM comments c WHERE c.article_id = a.id
+      ORDER BY c.created_at DESC, c.id DESC LIMIT 100) c ON true
+    LEFT JOIN users u ON u.id = c.author_id
+    WHERE a.slug = $2 ORDER BY c.created_at DESC, c.id DESC
     """
 
   fun insert_comment(): String =>
